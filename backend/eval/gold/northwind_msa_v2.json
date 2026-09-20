@@ -1,0 +1,17 @@
+{
+  "name": "northwind_msa_v2 (synthetic)",
+  "pdf": "../../sample_data/northwind_msa_v2.pdf",
+  "fields": {
+    "effective_date": "2026-01-15",
+    "expiration_date": "2027-12-31",
+    "auto_renew": true,
+    "renewal_notice_period": null,
+    "termination_notice_period": 60
+  },
+  "contains": {
+    "payment_terms": ["$12,000", "thirty (30) days"],
+    "renewal_terms": ["renews automatically", "one (1) year"],
+    "termination_conditions": ["sixty (60) days"]
+  },
+  "parties": ["Northwind Analytics Inc.", "Contoso Retail LLC"]
+}

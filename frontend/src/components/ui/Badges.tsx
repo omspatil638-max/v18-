@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { ClauseType, ObligationStatus, DeadlineType, ContractStatus } from "@/lib/types";
+import type { ClauseType, ContractStatus, ExtractionStatus, ObligationStatus } from "@/lib/types";
 
 // ─── Status Badge ──────────────────────────────────────────────────────────────
 
@@ -59,6 +59,44 @@ export function ContractStatusBadge({ status }: { status: ContractStatus }) {
   );
 }
 
+// ─── Extraction Status Chip (dashboard rows) ───────────────────────────────────
+
+const extractionChipConfig: Partial<Record<ExtractionStatus, { label: string; title: string; className: string }>> = {
+  complete: {
+    label: "Extracted",
+    title: "AI extraction completed. Each item still carries its own verification status.",
+    className: "bg-green-100 text-green-800 border-green-200",
+  },
+  partial: {
+    label: "Partial",
+    title: "Extraction only partly succeeded. Open the contract for details.",
+    className: "bg-amber-100 text-amber-800 border-amber-200",
+  },
+  unavailable: {
+    label: "AI extraction unavailable",
+    title: "The AI extraction did not run or failed. The document text is still stored and searchable.",
+    className: "bg-red-100 text-red-800 border-red-200",
+  },
+  legacy: {
+    label: "Not verified (re-run)",
+    title: "Extracted by an older version without verification. Re-run extraction to verify it.",
+    className: "bg-amber-100 text-amber-800 border-amber-200",
+  },
+};
+
+export function ExtractionStatusChip({ status }: { status: ExtractionStatus }) {
+  const cfg = extractionChipConfig[status];
+  if (!cfg) return null;
+  return (
+    <span
+      title={cfg.title}
+      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${cfg.className}`}
+    >
+      {cfg.label}
+    </span>
+  );
+}
+
 // ─── Clause Type Badge ─────────────────────────────────────────────────────────
 
 const clauseTypeColors: Record<ClauseType, string> = {
@@ -77,30 +115,9 @@ const clauseTypeColors: Record<ClauseType, string> = {
 export function ClauseTypeBadge({ type }: { type: ClauseType }) {
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${clauseTypeColors[type]}`}
+      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${clauseTypeColors[type] ?? clauseTypeColors.OTHER}`}
     >
       {type.replace(/_/g, " ")}
-    </span>
-  );
-}
-
-// ─── Deadline Type Badge ───────────────────────────────────────────────────────
-
-const deadlineTypeColors: Record<DeadlineType, string> = {
-  EXPIRY: "bg-red-100 text-red-800",
-  RENEWAL_NOTICE: "bg-blue-100 text-blue-800",
-  PAYMENT: "bg-green-100 text-green-800",
-  OBLIGATION: "bg-amber-100 text-amber-800",
-  OTHER: "bg-slate-100 text-slate-700",
-};
-
-export function DeadlineTypeBadge({ type }: { type: DeadlineType }) {
-  const label = type.replace(/_/g, " ");
-  return (
-    <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${deadlineTypeColors[type]}`}
-    >
-      {label}
     </span>
   );
 }
@@ -109,27 +126,30 @@ export function DeadlineTypeBadge({ type }: { type: DeadlineType }) {
 
 interface ContractTabsProps {
   contractId: string;
-  active: "overview" | "obligations" | "timeline" | "chat" | "source";
+  active: "overview" | "summary" | "obligations" | "timeline" | "chat" | "source" | "compare";
 }
 
 const tabs = [
   { key: "overview", label: "Overview", href: "" },
-  { key: "obligations", label: "Obligations", href: "/obligations" },
-  { key: "timeline", label: "Timeline", href: "/timeline" },
-  { key: "chat", label: "AI Assistant", href: "/chat" },
-  { key: "source", label: "Source Viewer", href: "/source" },
+  { key: "summary", label: "Brief", href: "/summary" },
+  { key: "obligations", label: "Commitments", href: "/obligations" },
+  { key: "timeline", label: "Schedule", href: "/timeline" },
+  { key: "chat", label: "Ask", href: "/chat" },
+  { key: "source", label: "Evidence", href: "/source" },
+  { key: "compare", label: "Changes", href: "/compare" },
 ] as const;
 
 export function ContractTabs({ contractId, active }: ContractTabsProps) {
   return (
-    <div className="border-b border-slate-200 bg-white px-8">
-      <nav className="flex gap-0 -mb-px">
+    <div data-print-hide className="border-b border-slate-200 bg-white px-2 sm:px-8">
+      <nav aria-label="Contract sections" className="flex gap-0 -mb-px overflow-x-auto">
         {tabs.map(({ key, label, href }) => {
           const isActive = key === active;
           return (
             <Link
               key={key}
               href={`/contracts/${contractId}${href}`}
+              aria-current={isActive ? "page" : undefined}
               className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
                 isActive
                   ? "border-blue-600 text-blue-600"
@@ -141,37 +161,6 @@ export function ContractTabs({ contractId, active }: ContractTabsProps) {
           );
         })}
       </nav>
-    </div>
-  );
-}
-
-// ─── Stat Card ─────────────────────────────────────────────────────────────────
-
-interface StatCardProps {
-  label: string;
-  value: string | number;
-  icon: React.ReactNode;
-  color?: "blue" | "green" | "amber" | "red" | "slate";
-}
-
-const statColors = {
-  blue: "bg-blue-50 text-blue-600",
-  green: "bg-green-50 text-green-600",
-  amber: "bg-amber-50 text-amber-600",
-  red: "bg-red-50 text-red-600",
-  slate: "bg-slate-100 text-slate-600",
-};
-
-export function StatCard({ label, value, icon, color = "blue" }: StatCardProps) {
-  return (
-    <div className="bg-white rounded-xl border border-slate-200 p-5 flex items-center gap-4">
-      <div className={`flex items-center justify-center w-11 h-11 rounded-xl ${statColors[color]}`}>
-        {icon}
-      </div>
-      <div>
-        <p className="text-sm text-slate-500">{label}</p>
-        <p className="text-2xl font-bold text-slate-900 mt-0.5">{value}</p>
-      </div>
     </div>
   );
 }

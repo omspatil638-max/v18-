@@ -1,206 +1,306 @@
 """
 vector_service.py
 -----------------
-Page-aware text chunking, embedding generation (OpenAI text-embedding-3-small or fallback),
-and vector similarity search over PostgreSQL JSONB embedding vectors.
+Retrieval chunks + full-text search (Postgres tsvector / GIN index).
+
+Keyword search alone fails on the way people actually talk ("when does it EXPIRE?" against
+a contract that says "ends", "can I CANCEL?" against "terminate"). Three things close that gap
+without needing an embedding model:
+
+  1. query expansion with a legal-domain synonym table (deterministic, works with no LLM)
+  2. matching on section HEADINGS as well as body text ("Term and Renewal", "Termination")
+  3. padding thin results with the document's opening (parties/preamble)
+
+Semantic (pgvector) retrieval is added in Phase 7 and will be combined with this (hybrid).
 """
 
-import re
-import math
-import uuid
 import logging
-from typing import List, Dict, Any, Optional
-from sqlalchemy import select, delete
+import re
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy import delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.models.models import ContractChunk
+from app.services import embedding_service
+from app.services.text_index import DocIndex, chunk_sections
 
 logger = logging.getLogger(__name__)
 
+RETRIEVAL_CHUNK_CHARS = 1400
+RETRIEVAL_OVERLAP = 200
+MIN_HITS_BEFORE_PADDING = 4
+MIN_SEMANTIC_SIMILARITY = 0.30     # cosine; below this a passage is noise, not evidence
+RRF_K = 60
 
-def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    """Calculate cosine similarity between two float vectors."""
-    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
-        return 0.0
-    dot = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(a * a for a in vec_a))
-    norm_b = math.sqrt(sum(b * b for b in vec_b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+_STOP = {
+    "the", "and", "for", "that", "this", "with", "are", "was", "were", "will", "shall", "may", "can", "could",
+    "would", "should", "does", "did", "has", "have", "had", "what", "when", "where", "which", "who", "whom",
+    "how", "why", "our", "your", "their", "its", "any", "all", "not", "but", "from", "into", "about", "there",
+    "contract", "agreement", "tell", "give", "show", "please", "need", "want", "know", "much", "many", "get",
+    "there", "them", "they", "then", "than", "also", "just", "like", "some", "does", "done", "make", "made",
+}
+
+# root -> related words that a contract is likely to use instead. Roots are matched by prefix,
+# so "expire", "expires", "expiry" and "expiration" all hit the "expir" entry.
+_END = ["end", "ends", "expir", "expiration", "terminat", "term", "until", "duration", "period", "renew", "through"]
+_PAY = ["payment", "pay", "fee", "fees", "invoice", "price", "charge", "amount", "cost", "compensation", "billing"]
+SYNONYMS: Dict[str, List[str]] = {
+    "expir": _END, "end": _END, "finish": _END, "last": _END, "long": ["term", "duration", "period", "until", "years", "months"],
+    "cancel": ["terminat", "cancellation", "notice", "convenience", "withdraw", "exit", "early"],
+    "terminat": ["termination", "cancel", "notice", "convenience", "breach", "cure", "expir", "early"],
+    "exit": ["terminat", "cancel", "notice", "convenience"],
+    "early": ["terminat", "convenience", "notice", "cancel"],
+    "pay": _PAY, "cost": _PAY, "price": _PAY, "fee": _PAY, "charge": _PAY, "money": _PAY, "invoice": _PAY,
+    "owe": _PAY, "bill": _PAY, "afford": _PAY, "subscription": _PAY,
+    "obligat": ["shall", "must", "agrees", "responsible", "responsibility", "required", "duty", "undertake", "deliver", "provide"],
+    "responsib": ["shall", "must", "obligat", "duty", "deliver"],
+    "duty": ["shall", "must", "obligat", "responsib"],
+    "deadline": ["due", "within", "days", "later", "date", "deliver", "submit"],
+    "due": ["within", "days", "deadline", "date", "payable", "invoice"],
+    "part": ["between", "agreement", "inc", "llc", "ltd", "limited", "corporation", "company", "provider", "customer"],
+    "who": ["between", "inc", "llc", "ltd", "limited", "corporation", "company"],
+    "compan": ["between", "inc", "llc", "ltd", "limited", "corporation", "provider", "customer"],
+    "renew": ["renewal", "extend", "extension", "automatic", "automatically", "successive", "term", "non-renewal"],
+    "extend": ["renew", "renewal", "extension", "term"],
+    "penalt": ["interest", "late", "damages", "liquidated", "fine", "charge", "default", "breach"],
+    "late": ["interest", "overdue", "unpaid", "penalty", "default", "due"],
+    "liab": ["liable", "damages", "indemn", "cap", "limit", "limitation", "responsible"],
+    "sue": ["liab", "damages", "dispute", "court", "jurisdiction", "arbitration"],
+    "risk": ["liab", "indemn", "damages", "warrant", "insurance", "limitation"],
+    "confiden": ["confidentiality", "disclose", "secret", "proprietary", "nda", "non-disclosure"],
+    "secret": ["confiden", "disclose", "proprietary"],
+    "start": ["effective", "commenc", "begin", "date", "signed"],
+    "begin": ["effective", "commenc", "start", "date"],
+    "effective": ["commenc", "start", "begin", "date"],
+    "govern": ["law", "jurisdiction", "courts", "dispute", "venue"],
+    "law": ["governing", "jurisdiction", "courts", "venue", "state"],
+    "dispute": ["arbitration", "jurisdiction", "governing", "litigation", "courts", "resolution"],
+    "data": ["personal", "privacy", "protection", "gdpr", "processing", "security", "breach"],
+    "privacy": ["data", "personal", "protection", "gdpr", "processing"],
+    "secur": ["data", "protection", "audit", "breach", "safeguard", "encryption"],
+    "warrant": ["guarantee", "represent", "assur", "disclaim"],
+    "insur": ["coverage", "indemnity", "liability", "policy"],
+    "assign": ["transfer", "subcontract", "delegate", "consent"],
+    "chang": ["amend", "modif", "variation", "written", "signed"],
+    "amend": ["change", "modif", "variation", "written", "signed"],
+    "sign": ["execut", "signature", "effective", "date"],
+    "own": ["intellectual", "property", "ownership", "rights", "license", "licence"],
+    "ip": ["intellectual", "property", "ownership", "license", "licence", "rights"],
+    "refund": ["credit", "return", "reimburs", "payment"],
+    "discount": ["fee", "price", "rebate", "credit"],
+    "tax": ["taxes", "gst", "vat", "fee", "payment"],
+    "audit": ["inspect", "records", "compliance", "report"],
+    "report": ["deliver", "submit", "audit", "quarterly", "annual"],
+    "notice": ["written", "notify", "days", "terminat", "renew"],
+    "support": ["service", "response", "maintenance", "sla", "availability"],
+    "sla": ["availability", "uptime", "service", "level", "credit", "response"],
+    "uptime": ["availability", "sla", "service", "level"],
+    "renewal": ["renew", "automatic", "successive", "term", "notice"],
+}
+
+_TOKEN = re.compile(r"[A-Za-z0-9]{2,}")
+
+_GREETING = re.compile(
+    r"^\s*(hi+|hello+|hey+|yo|howdy|greetings|good\s+(morning|afternoon|evening)|thanks?( you)?|thank you( so much)?|"
+    r"ok(ay)?|cool|great|nice|bye|goodbye|test(ing)?|are you there\??|who are you\??|what can you do\??|"
+    r"help|hello,?\s+who are you\??)[\s!.?]*$",
+    re.IGNORECASE,
+)
+
+
+def is_small_talk(question: str) -> bool:
+    """A greeting/thanks/'what can you do' — not a question about the contract."""
+    return bool(_GREETING.match(question or ""))
+
+
+def _stem(token: str) -> str:
+    """Crude suffix strip so 'expires' / 'obligations' / 'terminating' reach the synonym table."""
+    t = token.lower()
+    for suffix in ("ations", "ation", "ings", "ing", "ies", "ied", "ers", "er", "es", "ed", "s"):
+        if t.endswith(suffix) and len(t) - len(suffix) >= 3:
+            return t[: -len(suffix)]
+    return t
+
+
+def query_terms(question: str) -> List[str]:
+    """Content words of the question plus their domain synonyms, de-duplicated, order preserved."""
+    base: List[str] = []
+    for tok in _TOKEN.findall((question or "").lower()):
+        if tok not in _STOP and tok not in base and len(tok) >= 2:
+            base.append(tok)
+
+    expanded: List[str] = list(base)
+    for tok in base:
+        stem = _stem(tok)
+        for root, related in SYNONYMS.items():
+            if stem.startswith(root) or (len(stem) >= 4 and root.startswith(stem)):
+                for r in related:
+                    if r not in expanded:
+                        expanded.append(r)
+    return expanded
+
+
+def build_or_query(question: str) -> Optional[str]:
+    """A safe tsquery: alphanumeric tokens joined with OR (English stemming is applied by Postgres)."""
+    tokens = [t for t in query_terms(question) if re.fullmatch(r"[a-z0-9]+", t)]
+    return " | ".join(tokens[:40]) or None
+
+
+def heading_patterns(question: str) -> List[str]:
+    """ILIKE patterns for section headings ('Term and Renewal', 'Termination') the question points at."""
+    stems = {_stem(t) for t in query_terms(question) if len(t) >= 4}
+    return [f"%{s}%" for s in sorted(stems)][:30]
 
 
 class VectorService:
-    """Handles contract text chunking, embeddings, and vector similarity search."""
+    @classmethod
+    async def chunk_and_store(
+        cls, db: AsyncSession, contract_id: uuid.UUID, version_id: uuid.UUID, doc: DocIndex
+    ) -> int:
+        """Replace this VERSION's retrieval chunks with section-aware chunks of the whole document."""
+        await db.execute(delete(ContractChunk).where(ContractChunk.contract_version_id == version_id))
+        chunks = chunk_sections(doc.sections, RETRIEVAL_CHUNK_CHARS, RETRIEVAL_OVERLAP, pack=False)
+        rows = []
+        for c in chunks:
+            row = ContractChunk(
+                contract_id=contract_id, contract_version_id=version_id, chunk_index=c.index, content=c.text,
+                source_page=c.page_start, source_section=c.primary_section, embedding=None,
+            )
+            db.add(row)
+            rows.append(row)
+        await db.flush()
+        embedded = await cls._store_embeddings(db, rows)
+        logger.info("Stored %d retrieval chunks (%d embedded) for version %s", len(chunks), embedded, str(version_id)[:8])
+        return len(chunks)
 
     @classmethod
-    def chunk_text(cls, full_text: str, chunk_size: int = 600, overlap: int = 100) -> List[Dict[str, Any]]:
-        """
-        Split contract text into page-aware overlapping chunks.
-        Tracks current page based on '--- PAGE X ---' markers.
-        """
-        chunks = []
-        current_page = 1
-        lines = full_text.splitlines()
-
-        current_buffer = []
-        current_char_count = 0
-        chunk_index = 0
-
-        for line in lines:
-            # Check page marker
-            page_match = re.match(r"^---\s*PAGE\s+(\d+)\s*---", line, re.IGNORECASE)
-            if page_match:
-                current_page = int(page_match.group(1))
-                continue
-
-            current_buffer.append(line)
-            current_char_count += len(line) + 1
-
-            if current_char_count >= chunk_size:
-                text_block = "\n".join(current_buffer).strip()
-                if text_block:
-                    # Extract header/section heuristic
-                    section_match = re.search(r"^(?:Section\s+\d+|[\d\.]+\s+[A-Z\s]{3,})", text_block, re.MULTILINE)
-                    section_name = section_match.group(0).strip() if section_match else f"Page {current_page}"
-
-                    chunks.append({
-                        "chunk_index": chunk_index,
-                        "content": text_block,
-                        "source_page": current_page,
-                        "source_section": section_name,
-                    })
-                    chunk_index += 1
-
-                # Keep overlap from buffer
-                overlap_chars = 0
-                new_buffer = []
-                for b_line in reversed(current_buffer):
-                    new_buffer.insert(0, b_line)
-                    overlap_chars += len(b_line) + 1
-                    if overlap_chars >= overlap:
-                        break
-                current_buffer = new_buffer
-                current_char_count = sum(len(l) + 1 for l in current_buffer)
-
-        # Flush trailing buffer
-        if current_buffer:
-            text_block = "\n".join(current_buffer).strip()
-            if text_block:
-                chunks.append({
-                    "chunk_index": chunk_index,
-                    "content": text_block,
-                    "source_page": current_page,
-                    "source_section": f"Page {current_page}",
-                })
-
-        return chunks
-
-    @classmethod
-    async def get_embedding(cls, text: str) -> List[float]:
-        """
-        Generate embedding vector (1536 dim) for input text.
-        Uses OpenAI text-embedding-3-small if OPENAI_API_KEY is set.
-        Otherwise falls back to a deterministic 1536-dim feature vector.
-        """
-        openai_key = settings.OPENAI_API_KEY or getattr(settings, "openai_api_key", None)
-        if openai_key and openai_key.startswith("sk-"):
-            try:
-                import openai
-                client = openai.AsyncOpenAI(api_key=openai_key)
-                response = await client.embeddings.create(
-                    model="text-embedding-3-small",
-                    input=text[:8000]
-                )
-                return response.data[0].embedding
-            except Exception as e:
-                logger.warning(f"OpenAI embedding call failed ({e}). Using deterministic vector fallback.")
-
-        # Fallback: Deterministic normalized bag-of-words hash vector (1536 dim)
-        vector = [0.0] * 1536
-        words = re.findall(r"\w+", text.lower())
-        if not words:
-            return vector
-
-        for word in words:
-            # Hash word into 1536 buckets
-            h = hash(word) % 1536
-            vector[h] += 1.0
-
-        # L2 Normalize
-        norm = math.sqrt(sum(v * v for v in vector))
-        if norm > 0:
-            vector = [v / norm for v in vector]
-        return vector
-
-    @classmethod
-    async def chunk_and_store(cls, contract_id: uuid.UUID, full_text: str, db: AsyncSession) -> int:
-        """Chunk contract text, generate embeddings, and save ContractChunk rows in DB."""
-        # 1. Delete old chunks for this contract
-        await db.execute(delete(ContractChunk).where(ContractChunk.contract_id == contract_id))
-
-        # 2. Generate chunks
-        raw_chunks = cls.chunk_text(full_text)
-        if not raw_chunks:
+    async def _store_embeddings(cls, db: AsyncSession, rows: List[ContractChunk]) -> int:
+        """Embed locally and store next to the text. Never fatal: without vectors, search is keyword-only."""
+        if not rows:
+            return 0
+        try:
+            vectors = await embedding_service.embed_documents([r.content for r in rows])
+            if not vectors:
+                return 0
+            model = embedding_service.status()["model"]
+            await db.execute(
+                text("UPDATE contract_chunks SET embedding_vec = CAST(CAST(:v AS text) AS vector), embedding_model = :m WHERE id = :id"),
+                [{"v": embedding_service.vector_literal(v), "m": model, "id": r.id} for r, v in zip(rows, vectors)],
+            )
+            return len(rows)
+        except Exception as exc:  # noqa: BLE001 - e.g. pgvector extension missing
+            logger.warning("Could not store embeddings (%s); keyword search only.", exc.__class__.__name__)
             return 0
 
-        # 3. Create ContractChunk instances with embeddings
-        for c in raw_chunks:
-            emb = await cls.get_embedding(c["content"])
-            chunk_row = ContractChunk(
-                contract_id=contract_id,
-                chunk_index=c["chunk_index"],
-                content=c["content"],
-                source_page=c["source_page"],
-                source_section=c["source_section"],
-                embedding=emb
+    @classmethod
+    async def _vector_search(cls, db: AsyncSession, version_id: uuid.UUID, query: str, limit: int) -> List[Dict[str, Any]]:
+        try:
+            qv = await embedding_service.embed_query(query)
+            if qv is None:
+                return []
+            rows = await db.execute(
+                text(
+                    """
+                    SELECT id, chunk_index, content, source_page, source_section,
+                           1 - (embedding_vec <=> CAST(CAST(:qv AS text) AS vector)) AS sim
+                    FROM contract_chunks
+                    WHERE contract_version_id = :vid AND embedding_vec IS NOT NULL
+                    ORDER BY embedding_vec <=> CAST(CAST(:qv AS text) AS vector)
+                    LIMIT :lim
+                    """
+                ),
+                {"qv": embedding_service.vector_literal(qv), "vid": version_id, "lim": limit},
             )
-            db.add(chunk_row)
+            return [cls._row(r, r.sim, "semantic") for r in rows if r.sim >= MIN_SEMANTIC_SIMILARITY]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Vector search unavailable (%s); keyword search only.", exc.__class__.__name__)
+            await db.rollback()
+            return []
 
-        await db.commit()
-        logger.info(f"Chunked & stored {len(raw_chunks)} chunks for contract {str(contract_id)[:8]}")
-        return len(raw_chunks)
+    @staticmethod
+    def fuse(keyword: List[Dict[str, Any]], semantic: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        """
+        Reciprocal Rank Fusion: a chunk ranked well by EITHER method rises, and one ranked well by
+        BOTH rises most. Uses ranks only, so the two methods' incomparable scores never need mixing.
+        """
+        merged: Dict[str, Dict[str, Any]] = {}
+        scores: Dict[str, float] = {}
+        for source in (keyword, semantic):
+            for rank, item in enumerate(source):
+                cid = item["chunk_id"]
+                scores[cid] = scores.get(cid, 0.0) + 1.0 / (RRF_K + rank + 1)
+                if cid not in merged:
+                    merged[cid] = dict(item)
+                elif merged[cid]["why"] != item["why"]:
+                    merged[cid]["why"] = "both"
+        ordered = sorted(merged.values(), key=lambda d: (-scores[d["chunk_id"]], d["chunk_index"]))
+        for d in ordered:
+            d["score"] = round(scores[d["chunk_id"]], 5)
+        return ordered[:limit]
+
+    @staticmethod
+    def _row(r, score: Optional[float] = None, why: str = "keyword") -> Dict[str, Any]:
+        return {
+            "chunk_id": str(r.id), "chunk_index": r.chunk_index, "content": r.content,
+            "source_page": r.source_page, "source_section": r.source_section or f"Page {r.source_page}",
+            "score": float(score if score is not None else getattr(r, "score", 0.0)), "why": why,
+        }
 
     @classmethod
     async def search_chunks(
-        cls,
-        contract_id: uuid.UUID,
-        query: str,
-        top_k: int = 4,
-        db: AsyncSession = None
+        cls, db: AsyncSession, version_id: uuid.UUID, query: str, limit: int = 8, pad: bool = True
     ) -> List[Dict[str, Any]]:
         """
-        Perform vector similarity search over contract chunks stored in DB.
-        Returns top_k chunks sorted by cosine similarity score.
+        Best chunks for a question: body-text matches and section-heading matches, ranked together;
+        thin results are padded with the document opening so the model always has the parties.
         """
-        if not db:
-            return []
+        q = build_or_query(query)
+        pats = heading_patterns(query)
+        results: List[Dict[str, Any]] = []
 
-        # Get query vector
-        query_vec = await cls.get_embedding(query)
+        if q:
+            rows = await db.execute(
+                text(
+                    """
+                    SELECT c.id, c.chunk_index, c.content, c.source_page, c.source_section,
+                           ts_rank_cd(c.tsv, tq) AS body_score,
+                           (c.source_section ILIKE ANY (CAST(:pats AS text[]))) AS heading_hit
+                    FROM contract_chunks c, to_tsquery('english', :q) tq
+                    WHERE c.contract_version_id = :vid
+                      AND (c.tsv @@ tq OR c.source_section ILIKE ANY (CAST(:pats AS text[])))
+                    ORDER BY (ts_rank_cd(c.tsv, tq) + CASE WHEN c.source_section ILIKE ANY (CAST(:pats AS text[]))
+                                                           THEN 1.0 ELSE 0 END) DESC, c.chunk_index
+                    LIMIT :lim
+                    """
+                ),
+                # An empty array would be a type error; this placeholder matches no real heading.
+                # (It must never contain a NUL byte: PostgreSQL rejects \x00 in text.)
+                {"q": q, "vid": version_id, "lim": limit, "pats": pats or ["%zzq-no-such-heading-zzq%"]},
+            )
+            results = [
+                cls._row(r, r.body_score + (1.0 if r.heading_hit else 0.0), "heading" if r.heading_hit else "keyword")
+                for r in rows
+            ]
 
-        # Query all chunks for contract
-        stmt = select(ContractChunk).where(ContractChunk.contract_id == contract_id)
-        result = await db.execute(stmt)
-        chunks = result.scalars().all()
+        semantic = await cls._vector_search(db, version_id, query, limit=limit * 2)
+        if semantic:
+            results = cls.fuse(results, semantic, limit)
 
-        scored_chunks = []
-        for chunk in chunks:
-            chunk_vec = chunk.embedding or []
-            score = _cosine_similarity(query_vec, chunk_vec)
-            scored_chunks.append({
-                "chunk_id": str(chunk.id),
-                "chunk_index": chunk.chunk_index,
-                "content": chunk.content,
-                "source_page": chunk.source_page,
-                "source_section": chunk.source_section or f"Page {chunk.source_page}",
-                "score": score,
-            })
-
-        # Sort descending by similarity score
-        scored_chunks.sort(key=lambda x: x["score"], reverse=True)
-        return scored_chunks[:top_k]
+        if pad and len(results) < MIN_HITS_BEFORE_PADDING:
+            have = {r["chunk_id"] for r in results}
+            opening = await db.execute(
+                text(
+                    "SELECT id, chunk_index, content, source_page, source_section FROM contract_chunks "
+                    "WHERE contract_version_id = :vid ORDER BY chunk_index LIMIT 2"
+                ),
+                {"vid": version_id},
+            )
+            for r in opening:
+                if str(r.id) not in have and len(results) < limit:
+                    results.append(cls._row(r, 0.0, "opening"))
+        return results
 
 
 vector_service = VectorService()

@@ -1,214 +1,210 @@
 """
 deadline_service.py
 -------------------
-Pure-Python comprehensive deadline and reminder generation engine.
-Parses contract text, metadata, and obligations to extract 100% accurate dates and timelines.
+Builds Deadline, ObligationOccurrence and Alert rows for a version. Dates come from exactly
+three places, and every one is either stated in the document or computed in code:
+
+  1. dates stated in the contract         expiration date, explicit obligation dates
+  2. computed from a stated rule          "30 days after the effective date", "quarterly"
+  3. the actionable renewal deadline      expiration date minus the notice period
+
+Nothing is scraped from raw text and nothing is guessed: when a rule depends on something the
+contract does not give (an invoice date, a missing effective date) the obligation keeps its rule
+text and records WHY no date exists (due_rule_json["reason"]).
 """
 
-import re
 import logging
 from datetime import date, timedelta
-from typing import Optional, List, Tuple
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Contract, Obligation, Deadline, Reminder, DeadlineType
-from app.services.extraction_service import ExtractionResult, ExtractedObligation
+from app.core.config import settings
+from app.models.models import (
+    Alert, AlertSetting, Contract, ContractVersion, Deadline, DeadlineType, ExtractedField,
+    FieldStatus, Obligation, ObligationOccurrence,
+)
+from app.services import schedule_service as sched
+from app.services.validators import parse_date
 
 logger = logging.getLogger(__name__)
 
-REMINDER_WINDOWS = [30, 7]
-
-MONTHS_MAP = {
-    'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
-    'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6, 'july': 7, 'jul': 7,
-    'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'sept': 9, 'october': 10, 'oct': 10,
-    'november': 11, 'nov': 11, 'december': 12, 'dec': 12
-}
+DEADLINE_WINDOW_PAST_DAYS = 30
+DEADLINE_WINDOW_FUTURE_DAYS = 400
+MAX_DEADLINES_PER_OBLIGATION = 24
 
 
-def parse_date_robust(s: Optional[str]) -> Optional[date]:
-    """Parse YYYY-MM-DD, Month DD YYYY, DD Month YYYY, or MM/DD/YYYY reliably."""
-    if not s:
+def _field_date(f: Optional[ExtractedField]) -> Optional[date]:
+    if f is None or not f.value or f.status == FieldStatus.EXTRACTION_UNAVAILABLE.value:
         return None
-    s = str(s).strip().lower()
-
-    # 1. ISO format YYYY-MM-DD or YYYY/MM/DD
-    m = re.search(r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})', s)
-    if m:
-        try:
-            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            pass
-
-    # 2. Month DD, YYYY (e.g. January 15, 2026 or Jan 15 2026)
-    m = re.search(r'([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})', s)
-    if m and m.group(1) in MONTHS_MAP:
-        try:
-            return date(int(m.group(3)), MONTHS_MAP[m.group(1)], int(m.group(2)))
-        except ValueError:
-            pass
-
-    # 3. DD Month YYYY (e.g. 15th January 2026 or 15 Jan 2026)
-    m = re.search(r'(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)\s+(\d{4})', s)
-    if m and m.group(2) in MONTHS_MAP:
-        try:
-            return date(int(m.group(3)), MONTHS_MAP[m.group(2)], int(m.group(1)))
-        except ValueError:
-            pass
-
-    # 4. Standard Slash MM/DD/YYYY or DD/MM/YYYY
-    m = re.search(r'(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})', s)
-    if m:
-        n1, n2, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        # Guess month vs day
-        if n1 <= 12 and n2 <= 31:
-            try:
-                return date(y, n1, n2)
-            except ValueError:
-                pass
-        if n2 <= 12 and n1 <= 31:
-            try:
-                return date(y, n2, n1)
-            except ValueError:
-                pass
-
-    return None
+    return parse_date(f.value.get("date"))
 
 
-def extract_all_dates_with_context(text: str) -> List[Tuple[date, str, str]]:
-    """
-    Scans entire document text for all dates and extracts surrounding sentence context.
-    Returns list of (date_obj, label, context_snippet).
-    """
-    results = []
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-
-    date_pattern = re.compile(
-        r'\b(?:(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})'
-        r'|\b(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\s+\d{4})'
-        r'|\b(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2})'
-        r'|\b(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{4})\b',
-        re.IGNORECASE
-    )
-
-    for line in lines:
-        matches = date_pattern.findall(line)
-        for m_str in matches:
-            d_obj = parse_date_robust(m_str)
-            if d_obj:
-                line_lower = line.lower()
-                if any(w in line_lower for w in ["commenc", "effective", "entered into", "start"]):
-                    lbl = "Effective / Start Date"
-                elif any(w in line_lower for w in ["expir", "terminat", "end date", "valid until"]):
-                    lbl = "Contract Expiry Date"
-                elif any(w in line_lower for w in ["renew", "notice"]):
-                    lbl = "Renewal Notice Warning"
-                elif any(w in line_lower for w in ["pay", "fee", "due", "price", "amount"]):
-                    lbl = "Payment Deadline"
-                else:
-                    lbl = f"Key Contract Event: {line[:50]}..."
-                results.append((d_obj, lbl, line[:150]))
-
-    return results
+async def _lead_days(db: AsyncSession, user_id) -> List[int]:
+    setting = (await db.execute(select(AlertSetting).where(AlertSetting.user_id == user_id))).scalar_one_or_none()
+    if setting and setting.lead_days:
+        days = sorted({int(d) for d in setting.lead_days if isinstance(d, int) and d > 0}, reverse=True)
+        if days:
+            return days
+    return settings.alert_lead_days
 
 
-def _make_reminders(deadline: Deadline, user_id, today: date) -> list[Reminder]:
-    reminders = []
-    for days_before in REMINDER_WINDOWS:
-        remind_at = deadline.deadline_date - timedelta(days=days_before)
-        reminders.append(Reminder(
-            deadline_id=deadline.id,
-            user_id=user_id,
-            remind_at=remind_at,
-            acknowledged=False,
-            message=(
-                f"{days_before}-day alert: '{deadline.label}' is due on "
-                f"{deadline.deadline_date.isoformat()}."
-            )
+def alerts_for(deadline: Deadline, user_id, contract_id, lead_days: List[int], today: date) -> List[Alert]:
+    """One alert per configured lead time that is still ahead; if the deadline is nearer than every
+    lead time, a single alert for today so it is not silently missed. Past deadlines get none."""
+    if deadline.deadline_date < today:
+        return []
+    out = [
+        Alert(
+            user_id=user_id, contract_id=contract_id, deadline_id=deadline.id, lead_days=lead,
+            fire_on=deadline.deadline_date - timedelta(days=lead),
+            message=f"{lead}-day alert: '{deadline.label}' is due on {deadline.deadline_date.isoformat()}.",
+        )
+        for lead in lead_days
+        if deadline.deadline_date - timedelta(days=lead) >= today
+    ]
+    if not out:
+        days = (deadline.deadline_date - today).days
+        out.append(Alert(
+            user_id=user_id, contract_id=contract_id, deadline_id=deadline.id, lead_days=days, fire_on=today,
+            message=f"Approaching: '{deadline.label}' is due on {deadline.deadline_date.isoformat()} ({days} days).",
         ))
-    return reminders
+    return out
 
 
-async def generate_for_contract(
+async def generate_for_version(
+    db: AsyncSession,
     contract: Contract,
-    extraction: ExtractionResult,
-    user_id,
-    db: AsyncSession
-) -> None:
-    """
-    Generate Deadline + Reminder rows for a newly processed contract.
-    Extracts dates directly from metadata, obligations, and raw text scan.
-    """
-    today = date.today()
-    added_dates = set()
+    version: ContractVersion,
+    fields: List[ExtractedField],
+    obligations: List[Obligation],
+    today: Optional[date] = None,
+) -> int:
+    today = today or date.today()
+    by_key = {f.field_key: f for f in fields}
+    lead_days = await _lead_days(db, contract.user_id)
+    anchors = sched.Anchors(effective=_field_date(by_key.get("effective_date")),
+                            expiry=_field_date(by_key.get("expiration_date")))
+    created = 0
 
-    # ── 1. Expiry date from metadata ─────────────────────────────────────────
-    expiry_date = parse_date_robust(extraction.metadata.expiry_date) or contract.expiry_date
-    if expiry_date and expiry_date not in added_dates:
-        added_dates.add(expiry_date)
-        expiry_deadline = Deadline(
-            contract_id=contract.id,
-            label=f"Contract Expiry — {contract.title}",
-            deadline_date=expiry_date,
-            deadline_type=DeadlineType.EXPIRY,
+    # A rebuild must not leave alerts behind for deadlines that no longer exist.
+    await db.execute(delete(Alert).where(
+        Alert.deadline_id.in_(select(Deadline.id).where(Deadline.contract_version_id == version.id))
+    ))
+
+    async def add(label, when, dtype, quote, page, section, basis, obligation_id=None) -> None:
+        nonlocal created
+        dl = Deadline(
+            contract_id=contract.id, contract_version_id=version.id, obligation_id=obligation_id,
+            label=str(label)[:255], deadline_date=when, deadline_type=dtype,
+            source_quote=quote, source_page=page, source_section=section, basis=basis,
         )
-        db.add(expiry_deadline)
+        db.add(dl)
         await db.flush()
-        for r in _make_reminders(expiry_deadline, user_id, today):
-            db.add(r)
+        for alert in alerts_for(dl, contract.user_id, contract.id, lead_days, today):
+            db.add(alert)
+        created += 1
 
-        # Renewal notice 60 days before expiry
-        renewal_date = expiry_date - timedelta(days=60)
-        renewal_deadline = Deadline(
-            contract_id=contract.id,
-            label=f"Renewal Notice Warning (60-day prior) — {contract.title}",
-            deadline_date=renewal_date,
-            deadline_type=DeadlineType.RENEWAL_NOTICE,
-        )
-        db.add(renewal_deadline)
-        await db.flush()
-        for r in _make_reminders(renewal_deadline, user_id, today):
-            db.add(r)
+    def unverified(status: str) -> str:
+        return "" if status == FieldStatus.VERIFIED.value else " (unverified: needs review)"
 
-    # ── 2. Scan entire contract text for all dates ──────────────────────────
-    if contract.raw_text:
-        text_dates = extract_all_dates_with_context(contract.raw_text)
-        for d_obj, lbl, ctx in text_dates:
-            if d_obj not in added_dates:
-                added_dates.add(d_obj)
-                dl_type = DeadlineType.OTHER
-                if "Expiry" in lbl:
-                    dl_type = DeadlineType.EXPIRY
-                elif "Payment" in lbl:
-                    dl_type = DeadlineType.PAYMENT
-                elif "Renewal" in lbl:
-                    dl_type = DeadlineType.RENEWAL_NOTICE
+    # 1. contract expiration -----------------------------------------------------------------
+    exp = by_key.get("expiration_date")
+    if anchors.expiry and exp:
+        await add(f"Contract expires — {contract.title}", anchors.expiry, DeadlineType.EXPIRY,
+                  exp.source_quote, exp.page, exp.section,
+                  f"Expiration date stated in the contract{unverified(exp.status)}.")
 
-                dl_row = Deadline(
-                    contract_id=contract.id,
-                    label=lbl,
-                    deadline_date=d_obj,
-                    deadline_type=dl_type,
-                )
-                db.add(dl_row)
-                await db.flush()
-                for r in _make_reminders(dl_row, user_id, today):
-                    db.add(r)
+    # 2. renewal: the actionable deadline = expiration minus notice period -------------------
+    notice = by_key.get("renewal_notice_period")
+    if notice and notice.value and notice.status != FieldStatus.EXTRACTION_UNAVAILABLE.value:
+        due, basis = sched.renewal_notice_date(anchors.expiry, notice.value)
+        if due is not None:
+            auto = (by_key.get("auto_renew").value or {}).get("bool") if by_key.get("auto_renew") and by_key["auto_renew"].value else None
+            consequence = (" The contract renews automatically unless notice is given by this date." if auto is True
+                           else " This is the last day to give notice about renewal.")
+            await add(f"Renewal notice deadline — {contract.title}", due, DeadlineType.RENEWAL_NOTICE,
+                      notice.source_quote, notice.page, notice.section,
+                      f"{basis}.{consequence}{unverified(notice.status)}")
 
-    # ── 3. Obligations deadlines ─────────────────────────────────────────────
-    for extracted_ob in extraction.obligations:
-        ob_due = parse_date_robust(extracted_ob.due_date)
-        if ob_due and ob_due not in added_dates:
-            added_dates.add(ob_due)
-            ob_deadline = Deadline(
-                contract_id=contract.id,
-                label=f"Obligation: {extracted_ob.action[:120]}",
-                deadline_date=ob_due,
-                deadline_type=DeadlineType.OBLIGATION,
-            )
-            db.add(ob_deadline)
-            await db.flush()
-            for r in _make_reminders(ob_deadline, user_id, today):
-                db.add(r)
+    # 3. obligations: stated, computed, or recurring -----------------------------------------
+    for ob in obligations:
+        label = f"{ob.responsible_party}: {ob.action}"
+        rule = dict(ob.due_rule_json or {})
+        flag = unverified(ob.verification_status)
+        window_lo, window_hi = today - timedelta(days=DEADLINE_WINDOW_PAST_DAYS), today + timedelta(days=DEADLINE_WINDOW_FUTURE_DAYS)
 
-    logger.info("Generated %d total deadlines for contract %s", len(added_dates), str(contract.id)[:8])
+        async def occurrence_deadlines(occ: sched.Occurrences, skip: Optional[date] = None) -> None:
+            n = 0
+            for when, basis in occ.dates:
+                db.add(ObligationOccurrence(obligation_id=ob.id, due_date=when, basis=basis))
+                if when == skip or not (window_lo <= when <= window_hi) or n >= MAX_DEADLINES_PER_OBLIGATION:
+                    continue
+                n += 1
+                await add(label, when, DeadlineType.OBLIGATION, ob.source_quote, ob.source_page, ob.source_section,
+                          f"Recurring ({ob.recurrence or rule.get('recurrence', 'repeats')}): {basis}{flag}", ob.id)
+
+        if ob.due_rule_type == "fixed" and ob.due_date:
+            rule.update({"computed": False, "basis": "Date stated in the contract"})
+            await add(label, ob.due_date, DeadlineType.OBLIGATION, ob.source_quote, ob.source_page, ob.source_section,
+                      f"Due date stated in the contract for this obligation{flag}.", ob.id)
+            if rule.get("recurrence_hint"):     # "an ANNUAL report by March 31, 2027": repeats from that date
+                occ = sched.generate_occurrences({"recurrence": rule["recurrence_hint"]}, ob.due_rule, anchors, today,
+                                                 first_fixed=ob.due_date)
+                await occurrence_deadlines(occ, skip=ob.due_date)
+                rule["repeats"] = rule["recurrence_hint"]
+
+        elif ob.due_rule_type == "relative":
+            due, basis = sched.compute_relative(rule, anchors)
+            if due is not None:
+                ob.due_date = due
+                rule.update({"computed": True, "basis": basis})
+                await add(label, due, DeadlineType.OBLIGATION, ob.source_quote, ob.source_page, ob.source_section,
+                          f"Computed: {basis}{flag}.", ob.id)
+            else:
+                rule.update({"computed": False, "reason": basis})
+
+        elif ob.due_rule_type == "recurring":
+            occ = sched.generate_occurrences(rule, ob.due_rule, anchors, today)
+            if occ.dates:
+                upcoming = [d for d, _ in occ.dates if d >= today]
+                ob.due_date = upcoming[0] if upcoming else occ.dates[-1][0]
+                rule.update({"computed": True, "basis": f"Next of {len(occ.dates)} scheduled occurrences",
+                             "date_is": "next_occurrence"})
+                await occurrence_deadlines(occ)
+            else:
+                rule.update({"computed": False, "reason": occ.reason})
+
+        ob.due_rule_json = rule or None
+
+    logger.info("Generated %d deadlines for version %s", created, str(version.id)[:8])
+    return created
+
+
+async def regenerate_alerts_for_user(db: AsyncSession, user_id, today: Optional[date] = None) -> int:
+    """
+    Apply a changed set of lead times: rebuild the PENDING alerts of every live contract's current
+    deadlines. Alerts a person already acknowledged, or that were already emailed, are kept as-is.
+    """
+    today = today or date.today()
+    lead_days = await _lead_days(db, user_id)
+
+    await db.execute(delete(Alert).where(Alert.user_id == user_id, Alert.status == "PENDING"))
+
+    rows = (await db.execute(
+        select(Deadline)
+        .join(Contract, Contract.id == Deadline.contract_id)
+        .where(Contract.user_id == user_id, Contract.deleted_at.is_(None),
+               Deadline.contract_version_id == Contract.current_version_id, Deadline.deadline_date >= today)
+    )).scalars().all()
+
+    existing = {(a.deadline_id, a.lead_days) for a in (await db.execute(
+        select(Alert).where(Alert.user_id == user_id))).scalars().all()}
+    made = 0
+    for dl in rows:
+        for alert in alerts_for(dl, user_id, dl.contract_id, lead_days, today):
+            if (alert.deadline_id, alert.lead_days) not in existing:
+                db.add(alert)
+                made += 1
+    return made

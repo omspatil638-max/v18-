@@ -42,6 +42,12 @@ class PDFService:
 
         try:
             doc = pymupdf.open(file_path)
+            if doc.needs_pass:
+                doc.close()
+                return PDFExtractionResult(
+                    is_valid_text_pdf=False, page_count=0, total_char_count=0, pages=[], full_text="",
+                    error_message="This PDF is password-protected. Remove the password and upload it again.",
+                )
             page_count = len(doc)
 
             if page_count == 0:
@@ -62,7 +68,7 @@ class PDFService:
             for page_num in range(page_count):
                 page = doc.load_page(page_num)
                 # Extract plain text from page
-                page_text = page.get_text("text").strip()
+                page_text = page.get_text("text").replace("\x00", "").strip()
                 char_count = len(page_text)
                 total_chars += char_count
 

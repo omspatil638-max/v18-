@@ -1,0 +1,17 @@
+{
+  "name": "long_contract (synthetic, 15k chars)",
+  "pdf": "../../sample_data/long_contract.pdf",
+  "fields": {
+    "effective_date": "2026-01-15",
+    "expiration_date": "2028-12-31",
+    "auto_renew": true,
+    "renewal_notice_period": 60,
+    "termination_notice_period": 90
+  },
+  "contains": {
+    "payment_terms": ["$12,500", "thirty (30) days"],
+    "renewal_terms": ["renews automatically", "one (1) year"],
+    "termination_conditions": ["ninety (90) days"]
+  },
+  "parties": ["Northwind Analytics Inc.", "Contoso Retail LLC"]
+}

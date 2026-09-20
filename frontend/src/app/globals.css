@@ -32,3 +32,53 @@ html {
 ::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
 }
+
+/* ── PDF viewer: one soft pulse when the cited text is highlighted ── */
+@keyframes cl-highlight-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.85);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(245, 158, 11, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0);
+  }
+}
+.cl-highlight-pulse {
+  animation: cl-highlight-pulse 1.2s ease-out 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cl-highlight-pulse {
+    animation: none;
+  }
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+/* ── Printing (used by the summary page): hide app chrome, let the content flow onto pages ── */
+@media print {
+  [data-print-hide] {
+    display: none !important;
+  }
+  html,
+  body {
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+  body {
+    display: block !important;
+  }
+  main,
+  main > div {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+  a {
+    color: inherit !important;
+    text-decoration: none !important;
+  }
+}

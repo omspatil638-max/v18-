@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import { Sidebar } from "@/components/Sidebar";
+import { AppShell } from "@/components/AppShell";
 
 export const metadata: Metadata = {
   title: "ContractLens",
@@ -14,9 +14,8 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className="flex h-screen overflow-hidden bg-slate-50">
-        <Sidebar />
-        <main className="flex-1 overflow-y-auto">{children}</main>
+      <body className="flex flex-col md:flex-row h-screen h-dvh overflow-hidden bg-slate-50">
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );

@@ -22,3 +22,12 @@ frontend/.env.local
 *.swp
 *.ds_store
 Thumbs.db
+
+# Local launcher output
+*.log
+
+# Python virtualenv
+.venv/
+
+# Local model cache
+backend/.cache/

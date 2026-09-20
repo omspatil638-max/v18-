@@ -1,4 +1,3 @@
-version: "3.9"
 
 services:
   postgres:
@@ -10,7 +9,10 @@ services:
       POSTGRES_PASSWORD: contractlens
       POSTGRES_DB: contractlens
     ports:
-      - "5432:5432"
+      # Bound to loopback ONLY. "5432:5432" would publish the database on every
+      # network interface, letting anyone on the same Wi-Fi/LAN connect with the
+      # default credentials below.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

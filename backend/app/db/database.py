@@ -8,7 +8,7 @@ class Base(DeclarativeBase):
 
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=(settings.APP_ENV == "development"),
+    echo=settings.DB_ECHO,  # off by default: it would log every question and contract text
     future=True
 )
 

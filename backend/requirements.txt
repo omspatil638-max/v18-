@@ -6,9 +6,19 @@ alembic>=1.13.1
 pydantic>=2.6.4
 pydantic-settings>=2.2.1
 anthropic>=0.19.0
-openai>=1.14.0
 pymupdf>=1.23.26
 python-multipart>=0.0.9
 pgvector>=0.2.5
 python-dotenv>=1.0.1
 httpx>=0.27.0
+
+# tests
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Local embeddings (free, private, no API key): ~67 MB model downloaded once on first use
+fastembed>=0.3
+pywebpush>=2.0
+python-docx>=1.1
+rapidocr-onnxruntime>=1.2
+tzdata>=2024.1

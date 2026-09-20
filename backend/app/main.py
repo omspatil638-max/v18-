@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -5,26 +6,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.db.database import engine, AsyncSessionLocal
 from app.db.seed import seed_demo_user
-from app.api import contracts, obligations, deadlines, chat, reminders, clauses
+from app.api import alerts, auth, chat, clauses, compare, contracts, data, deadlines, flags, obligations, pages, policy, portfolio, push, quality, renewals, review, search, summary, system
+from app.services import alert_service, job_runner
+
+logging.basicConfig(level=settings.LOG_LEVEL.upper())
+logger = logging.getLogger("contractlens")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup actions
+    settings.validate_for_startup()
     settings.absolute_storage_path
-    async with AsyncSessionLocal() as session:
-        await seed_demo_user(session)
+    if settings.AUTH_MODE in ("demo", "auto"):
+        if settings.AUTH_MODE == "demo":
+            logger.warning("AUTH_MODE=demo: all requests share ONE unauthenticated demo user. Local trial only.")
+        async with AsyncSessionLocal() as session:
+            await seed_demo_user(session)
+    if settings.APP_ENV != "test":
+        await job_runner.recover_incomplete()
+        alert_service.start_scheduler()          # emails due alerts when SMTP is configured; harmless otherwise
     yield
-    # Shutdown actions
+    await alert_service.stop_scheduler()
+    await job_runner.wait_idle()
     await engine.dispose()
 
 app = FastAPI(
     title="ContractLens API",
-    description="Privacy-conscious AI contract intelligence system",
-    version="0.1.0",
-    lifespan=lifespan
+    description="AI-assisted contract review with verifiable, source-linked outputs. Not legal advice.",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
@@ -33,18 +45,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include API routers
-app.include_router(contracts.router, prefix="/api")
-app.include_router(obligations.router, prefix="/api")
-app.include_router(deadlines.router, prefix="/api")
-app.include_router(chat.router, prefix="/api")
-app.include_router(reminders.router, prefix="/api")
-app.include_router(clauses.router, prefix="/api")
+for r in (auth.router, system.router, contracts.router, obligations.router, deadlines.router,
+          chat.router, alerts.router, clauses.router, flags.router, compare.router, summary.router, pages.router, push.router, review.router, quality.router, search.router, renewals.router, portfolio.router, policy.router, data.router):
+    app.include_router(r, prefix="/api")
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    return {
-        "status": "healthy",
-        "app": "ContractLens API",
-        "environment": settings.APP_ENV
-    }
+    return {"status": "healthy", "app": "ContractLens API", "environment": settings.APP_ENV}
